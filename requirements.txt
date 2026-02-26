@@ -1,0 +1,2 @@
+paradex-py
+aiohttp
