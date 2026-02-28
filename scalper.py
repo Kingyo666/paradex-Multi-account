@@ -15,6 +15,8 @@ import logging
 import time
 import os
 import sys
+import threading
+import select
 from collections import deque
 from datetime import datetime, time as dt_time
 from typing import Optional, Dict, Any
@@ -193,7 +195,8 @@ class BalancePnLTracker:
         self.last_valid_balance = 0.0
         self.long_count = 0
         self.short_count = 0
-    
+        self.recent_cycles = deque(maxlen=3)  # 记录最近3次 (balance_after, volume)
+
     def set_initial_balance(self, balance: float):
         if balance <= 0:
             return False
@@ -201,30 +204,45 @@ class BalancePnLTracker:
         self.current_balance = balance
         self.last_valid_balance = balance
         return True
-    
-    def update_balance(self, balance: float) -> bool:
+
+    def update_balance(self, balance: float, cycle_volume: float = 0.0) -> bool:
         if balance <= 0:
             return False
         self.current_balance = balance
         self.last_valid_balance = balance
+        # 记录到最近循环队列
+        if cycle_volume > 0:
+            self.recent_cycles.append((balance, cycle_volume))
         return True
-    
+
     def record_cycle_volume(self, price: float, size: float, direction: str):
         self.total_volume_usd += price * size * 2
         if direction == "LONG":
             self.long_count += 1
         else:
             self.short_count += 1
-    
+
     def get_real_pnl(self) -> float:
         return self.current_balance - self.initial_balance
-    
+
+    def get_recent_wear(self) -> float:
+        """最近3次的磨损/万U"""
+        if len(self.recent_cycles) < 2:
+            return 0.0
+        first_balance = self.recent_cycles[0][0]
+        last_balance = self.recent_cycles[-1][0]
+        total_vol = sum(v for _, v in self.recent_cycles)
+        if total_vol == 0:
+            return 0.0
+        return abs(last_balance - first_balance) / total_vol * 10000
+
     def get_stats(self) -> dict:
         real_pnl = self.get_real_pnl()
         if self.total_volume_usd == 0:
             return {
                 "pnl": real_pnl, "volume": 0,
                 "per_10k": 0, "per_100k": 0, "per_million": 0,
+                "recent_wear": 0.0,
                 "initial": self.initial_balance, "current": self.current_balance,
                 "long": self.long_count, "short": self.short_count,
             }
@@ -234,6 +252,7 @@ class BalancePnLTracker:
             "per_10k": cost_rate * 10000,
             "per_100k": cost_rate * 100000,
             "per_million": cost_rate * 1000000,
+            "recent_wear": self.get_recent_wear(),
             "initial": self.initial_balance, "current": self.current_balance,
             "long": self.long_count, "short": self.short_count,
         }
@@ -714,6 +733,7 @@ class WebSocketScalper:
         self.accounts = accounts
         self.current_account_index = 0
         self.current_account_name = accounts[0]["name"] if accounts else ""
+        self.accounts_completed = 0  # 已完成的账号数量
 
         self.paradex: Optional[ParadexSubkey] = None
         self.rate_limiter = RateLimiter(MAX_ORDERS_PER_MINUTE, MAX_ORDERS_PER_HOUR, MAX_ORDERS_PER_DAY)
@@ -750,6 +770,11 @@ class WebSocketScalper:
         self.high_cost_start_time = 0.0  # 磨损首次超标的时间
         self.SWITCH_COST_DELAY_SECONDS = 6  # 磨损超标后需要持续的秒数
 
+        # 熔断保护
+        self.circuit_break = False  # 熔断状态
+        self.CIRCUIT_BREAK_THRESHOLD = 0.3  # 熔断阈值：实时磨损超过0.3/万
+        self.CIRCUIT_BREAK_DURATION = 60  # 熔断暂停时长（秒）
+
         # 定时时间段配置（24小时，每小时一个标记）
         self.schedule_slots = self._load_schedule_config()  # 从文件加载配置
         self.schedule_config_file = "schedule_config.json"  # 配置文件路径
@@ -772,6 +797,37 @@ class WebSocketScalper:
         self.recent_cycle_times = deque(maxlen=5)
         self.last_display_update = 0  # 控制显示刷新频率
         self.recent_freshness = deque(maxlen=3)  # 近3次交易的新鲜度延迟（毫秒）
+
+        # 键盘监听
+        self.quit_flag = False
+        self._start_keyboard_listener()
+
+    def _start_keyboard_listener(self):
+        """启动键盘监听线程"""
+        def listen():
+            import sys
+            import tty
+            import termios
+
+            # 保存原始终端设置
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+
+            try:
+                tty.setcbreak(fd)
+                while not self.quit_flag:
+                    if sys.stdin in select.select([sys.stdin], [], [], 0.1)[0]:
+                        ch = sys.stdin.read(1)
+                        if ch.lower() == 'q':
+                            print("\n\n🛑 检测到 'q' 键，准备退出...")
+                            self.quit_flag = True
+                            self.running = False
+                            break
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+        listener_thread = threading.Thread(target=listen, daemon=True)
+        listener_thread.start()
     
     def update_display(self, status: str = None):
         """更新固定面板显示"""
@@ -782,8 +838,11 @@ class WebSocketScalper:
 
         now = time.time()
 
-        # 使用 trade_state 作为状态显示
-        display_status = status if status else self.trade_state
+        # 使用 trade_state 作为状态显示，熔断时优先显示熔断状态
+        if self.circuit_break:
+            display_status = "🔴 熔断保护中"
+        else:
+            display_status = status if status else self.trade_state
         ws_age = (now - bbo["last_update"]) * 1000 if bbo["last_update"] > 0 else 0
         elapsed = now - self.start_time if self.start_time else 0
         elapsed_min = elapsed / 60
@@ -814,14 +873,14 @@ class WebSocketScalper:
             "═" * 70,
             f"  📊 Paradex BTC 双向秒开关 v6 多号版 | 状态: {display_status}",
             "═" * 70,
-            f"  👤 账号: [{self.current_account_index + 1}/{len(self.accounts)}] {self.current_account_name}",
+            f"  👤 账号: [{self.current_account_index + 1}/{len(self.accounts)}] {self.current_account_name}  |  余额: ${stats['current']:.2f} USDC",
             f"  💰 价格: ${bbo['mid_price']:.0f}  |  价差: {bbo['spread']:.5f}%  |  波动率: {vol_color}{volatility:.4f}%",
             f"  📈 深度: 买一 {bbo['bid_size']:.4f} BTC  |  卖一 {bbo['ask_size']:.4f} BTC  |  方向: {direction}",
-            f"  🔄 循环: {self.cycle_count}/{MAX_CYCLES} (多:{stats['long']} 空:{stats['short']})  |  上次: {self.last_direction}",
+            f"  🔄 循环: {self.cycle_count}/{MAX_CYCLES} (多:{stats['long']} 空:{stats['short']})  |  上次: {self.last_direction}  |  已完成: {self.accounts_completed}/{len(self.accounts)}账号",
             f"  💵 盈亏: {pnl_color}{stats['pnl']:.4f} U  |  成交量: ${stats['volume']/1000:.1f}K",
             f"  🚦 限速: {min_o}/{MAX_ORDERS_PER_MINUTE}分 | {hr_o}/{MAX_ORDERS_PER_HOUR}时 | {day_o}/{MAX_ORDERS_PER_DAY}日",
             f"  ⏱️ 新鲜度: {freshness}  |  近3单: [{recent_freshness_str}]ms",
-            f"  ⏱️ 循环延迟: [{self.latency_tracker.format_recent()}]ms  |  磨损: {stats['per_10k']:+.2f}/万(<-¥{SWITCH_COST_PER_10K}切换)",
+            f"  ⏱️ 循环延迟: [{self.latency_tracker.format_recent()}]ms  |  磨损: {stats['per_10k']:+.2f}/万(<-¥{SWITCH_COST_PER_10K}切换)  |  实时磨损: {stats['recent_wear']:.2f}/万",
         ]
 
         self.panel.update(lines)
@@ -1220,7 +1279,8 @@ class WebSocketScalper:
         print("=" * 70)
         print(f"📊 配置: {ORDER_SIZE_BTC} BTC | 价差≤{MAX_SPREAD_PERCENT}%")
         print(f"🚦 限速: {MAX_ORDERS_PER_MINUTE}/分 | {MAX_ORDERS_PER_HOUR}/时 | {MAX_ORDERS_PER_DAY}/24h")
-        print(f"🔄 账号数: {len(self.accounts)} | 切换阈值: ¥{SWITCH_COST_PER_10K}/万")
+        print(f"🔄 账号数: {len(self.accounts)} | 切���阈值: ¥{SWITCH_COST_PER_10K}/万")
+        print(f"⌨️  按 'q' 键随时退出")
         print("=" * 70)
 
         # 发送启动通知
@@ -1267,6 +1327,17 @@ class WebSocketScalper:
                 if result == "STOP_REQUESTED":
                     break  # 停止请求，退出
                 elif result == "SWITCH_ACCOUNT":
+                    self.accounts_completed += 1
+                    logger.info(f"📊 已完成账号: {self.accounts_completed}/{len(self.accounts)}")
+
+                    # 检查是否所有账号都已完成
+                    if self.accounts_completed >= len(self.accounts):
+                        logger.info(f"✅ 所有 {len(self.accounts)} 个账号已完成交易")
+                        print(f"\n{'='*70}")
+                        print(f"✅ 所有 {len(self.accounts)} 个账号已完成 {MAX_CYCLES} 次循环")
+                        print(f"{'='*70}\n")
+                        break
+
                     await self.reset_for_new_account()
                     await asyncio.sleep(2)  # 等待2秒再连接下一个账号
                     continue
@@ -1287,6 +1358,16 @@ class WebSocketScalper:
         while self.running and self.cycle_count < MAX_CYCLES:
             if os.path.exists(EMERGENCY_STOP_FILE):
                 break
+
+            # 检查 q 键退出
+            if self.quit_flag:
+                logger.info("🛑 检测到 'q' 键，准备退出...")
+                print("\n🛑 正在平仓并退出...")
+                position = self.get_current_position()
+                if position:
+                    await self.close_position(position)
+                    await asyncio.sleep(0.3)
+                return "STOP_REQUESTED"
 
             # ========== 交易状态控制 ==========
             # 检查停止请求 - 先平仓再停止
@@ -1454,11 +1535,35 @@ class WebSocketScalper:
                         await asyncio.sleep(0.2)
                         balance = self.get_account_balance()
                         if balance > 0:
-                            self.pnl_tracker.update_balance(balance)
+                            # 计算本次循环的交易量
+                            cycle_volume = price * ORDER_SIZE_BTC * 2
+                            self.pnl_tracker.update_balance(balance, cycle_volume)
                             last_balance_check = time.time()
 
-                            # 检查磨损是否超过阈值 - 持续8秒才切换
+                            # 熔断检查：实时磨损过高
                             stats = self.pnl_tracker.get_stats()
+                            recent_wear = stats['recent_wear']
+                            if recent_wear > self.CIRCUIT_BREAK_THRESHOLD:
+                                self.circuit_break = True
+                                self.pnl_tracker.recent_cycles.clear()
+                                logger.warning(f"🔴 触发熔断！实时磨损: {recent_wear:.2f}/万 > {self.CIRCUIT_BREAK_THRESHOLD}")
+                                await self.tg_notifier.send(
+                                    f"🔴 *熔断保护触发*\n\n"
+                                    f"实时磨损: `{recent_wear:.2f}/万`\n"
+                                    f"阈值: `{self.CIRCUIT_BREAK_THRESHOLD}/万`\n"
+                                    f"暂停 `{self.CIRCUIT_BREAK_DURATION}` 秒"
+                                )
+                                for remaining in range(self.CIRCUIT_BREAK_DURATION, 0, -1):
+                                    if not self.running:
+                                        break
+                                    self.update_display(f"🔴 熔断暂停 {remaining}s")
+                                    await asyncio.sleep(1)
+                                self.circuit_break = False
+                                logger.info("✅ 熔断结束，恢复交易")
+                                await self.tg_notifier.send("✅ 熔断结束，恢复交易")
+                                continue
+
+                            # 检查磨损是否超过阈值 - 持续8秒才切换
                             now = time.time()
 
                             if stats['per_10k'] < -SWITCH_COST_PER_10K:
@@ -1500,7 +1605,9 @@ class WebSocketScalper:
 
             await asyncio.sleep(0.05)
 
-        return "NORMAL_EXIT"
+        # 达到最大循环次数，切换到下一个账号
+        logger.info(f"✅ 达到最大循环次数 {MAX_CYCLES}，准备切换账号")
+        return "SWITCH_ACCOUNT"
 
     async def execute_cycle(self, price: float, direction: str) -> tuple[bool, bool]:
         """执行一个开平仓循环
@@ -1560,8 +1667,26 @@ class WebSocketScalper:
         try:
             side = "SELL" if position["side"] == "LONG" else "BUY"
             self.place_market_order(side, position["size"])
-            logger.info(f"✅ 平仓: {position['side']} {position['size']}")
-            return True
+            logger.info(f"✅ 平仓订单已提交: {position['side']} {position['size']}")
+
+            # 等待订单成交，最多等待5秒
+            for i in range(10):
+                await asyncio.sleep(0.5)
+                current_pos = self.get_current_position()
+                if current_pos is None:
+                    logger.info(f"✅ 平仓成功确认")
+                    return True
+                logger.debug(f"等待平仓完成... ({i+1}/10)")
+
+            # 超时后再次检查
+            current_pos = self.get_current_position()
+            if current_pos is None:
+                logger.info(f"✅ 平仓成功（延迟确认）")
+                return True
+            else:
+                logger.warning(f"⚠️ 平仓可能未完成，剩余持仓: {current_pos}")
+                return False
+
         except Exception as e:
             logger.error(f"平仓失败: {e}")
             return False
@@ -1810,6 +1935,27 @@ class WebSocketScalper:
             )
             await self.tg_notifier.send(report)
 
+        # 切换前先平仓
+        position = self.get_current_position()
+        if position:
+            print(f"\n🔄 切换账号前，正在平仓 {position['side']} {position['size']} BTC...")
+            close_success = await self.close_position(position)
+
+            if not close_success:
+                logger.error("❌ 平仓失败，取消切换账号")
+                print("❌ 平仓失败，取消切换账号")
+                return
+
+            # 再次确认持仓已清空
+            await asyncio.sleep(0.5)
+            final_check = self.get_current_position()
+            if final_check:
+                logger.error(f"❌ 持仓未清空 {final_check}，取消切换账号")
+                print(f"❌ 持仓未清空，取消切换账号")
+                return
+
+            print(f"✅ 持仓已清空，继续切换账号")
+
         # 切换到下一个账号
         self.current_account_index = (self.current_account_index + 1) % len(self.accounts)
 
@@ -1820,7 +1966,8 @@ class WebSocketScalper:
             pass
 
         print(f"\n{'='*70}")
-        print(f"🔄 切换到: {self.accounts[self.current_account_index]['name']}")
+        print(f"🔄 切换到账号: [{self.current_account_index + 1}/{len(self.accounts)}] {self.accounts[self.current_account_index]['name']}")
+        print(f"📊 进度: 已完成 {self.accounts_completed}/{len(self.accounts)} 个账号")
         print(f"{'='*70}\n")
 
     async def reset_for_new_account(self):
@@ -1832,6 +1979,7 @@ class WebSocketScalper:
         self.last_direction = "-"
         self.ws_update_count = 0
         self.high_cost_start_time = 0.0  # 重置磨损计时器
+        self.circuit_break = False  # 重置熔断状态
         self.pnl_tracker = BalancePnLTracker()
         self.rate_limiter = RateLimiter(MAX_ORDERS_PER_MINUTE, MAX_ORDERS_PER_HOUR, MAX_ORDERS_PER_DAY)
         self.latency_tracker = LatencyTracker()

@@ -1,0 +1,38 @@
+# 配置文件（包含敏感信息）
+config.py
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 日志文件
+*.log
+
+# 临时文件
+*.tmp
+*.bak
+*.swp
+*~
+
+# 紧急停止文件
+STOP
+
+# 定时配置
+schedule_config.json
+
+# IDE 配置
+.vscode/
+.idea/
+*.sublime-*
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 虚拟环境
+venv/
+env/
+ENV/
