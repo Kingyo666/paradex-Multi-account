@@ -1530,7 +1530,6 @@ class WebSocketScalper:
                             if await self.check_and_handle_last_account():
                                 continue  # 暂停后继续当前账号
 
-                            await self.switch_account("检测到手续费")
                             # 检查连续低量切号是否达上限
                             if self.consecutive_low_volume_switches >= self.MAX_CONSECUTIVE_LOW_VOLUME:
                                 logger.warning("🚫 连续低量切号达上限，暂停脚本")
@@ -1542,6 +1541,8 @@ class WebSocketScalper:
                                 self.trade_state = self.STATE_PAUSED
                                 self.consecutive_low_volume_switches = 0
                                 continue
+
+                            await self.switch_account("检测到手续费")
                             return "SWITCH_ACCOUNT"
 
                         await asyncio.sleep(0.2)
@@ -1592,7 +1593,6 @@ class WebSocketScalper:
                                     if await self.check_and_handle_last_account():
                                         continue  # 暂停后继续当前账号
 
-                                    await self.switch_account(f"磨损过高({stats['per_10k']:+.2f}/万)")
                                     # 检查连续低量切号是否达上限
                                     if self.consecutive_low_volume_switches >= self.MAX_CONSECUTIVE_LOW_VOLUME:
                                         logger.warning("🚫 连续低量切号达上限，暂停脚本")
@@ -1604,6 +1604,8 @@ class WebSocketScalper:
                                         self.trade_state = self.STATE_PAUSED
                                         self.consecutive_low_volume_switches = 0
                                         continue
+
+                                    await self.switch_account(f"磨损过高({stats['per_10k']:+.2f}/万)")
                                     return "SWITCH_ACCOUNT"
                             else:
                                 # 磨损正常，重置计时
