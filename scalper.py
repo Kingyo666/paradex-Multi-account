@@ -734,6 +734,12 @@ class WebSocketScalper:
         self.current_account_index = 0
         self.current_account_name = accounts[0]["name"] if accounts else ""
         self.accounts_completed = 0  # 已完成的账号数量
+        self.account_volumes = {}  # 记录每个账号的成交量 {account_index: volume}
+        self.account_retry_count = {}  # 记录每个账号的重试次数 {account_index: count}
+        self.round_completed = False  # 是否完成一轮(所有号都切过)
+        self.min_volume_threshold = 100000  # 最小成交量阈值，启动时输入
+        self.max_round_retries = 100  # 最大轮询次数，启动时输入
+        self.current_round = 0  # 当前轮数
 
         self.paradex: Optional[ParadexSubkey] = None
         self.rate_limiter = RateLimiter(MAX_ORDERS_PER_MINUTE, MAX_ORDERS_PER_HOUR, MAX_ORDERS_PER_DAY)
@@ -876,7 +882,7 @@ class WebSocketScalper:
             f"  👤 账号: [{self.current_account_index + 1}/{len(self.accounts)}] {self.current_account_name}  |  余额: ${stats['current']:.2f} USDC",
             f"  💰 价格: ${bbo['mid_price']:.0f}  |  价差: {bbo['spread']:.5f}%  |  波动率: {vol_color}{volatility:.4f}%",
             f"  📈 深度: 买一 {bbo['bid_size']:.4f} BTC  |  卖一 {bbo['ask_size']:.4f} BTC  |  方向: {direction}",
-            f"  🔄 循环: {self.cycle_count}/{MAX_CYCLES} (多:{stats['long']} 空:{stats['short']})  |  上次: {self.last_direction}  |  已完成: {self.accounts_completed}/{len(self.accounts)}账号",
+            f"  🔄 循环: {self.cycle_count}/{MAX_CYCLES} (多:{stats['long']} 空:{stats['short']})  |  上次: {self.last_direction}  |  轮次: {self.current_round + 1} ({len(self.account_volumes)}/{len(self.accounts)}号)",
             f"  💵 盈亏: {pnl_color}{stats['pnl']:.4f} U  |  成交量: ${stats['volume']/1000:.1f}K",
             f"  🚦 限速: {min_o}/{MAX_ORDERS_PER_MINUTE}分 | {hr_o}/{MAX_ORDERS_PER_HOUR}时 | {day_o}/{MAX_ORDERS_PER_DAY}日",
             f"  ⏱️ 新鲜度: {freshness}  |  近3单: [{recent_freshness_str}]ms",
@@ -1281,6 +1287,7 @@ class WebSocketScalper:
         print(f"🚦 限速: {MAX_ORDERS_PER_MINUTE}/分 | {MAX_ORDERS_PER_HOUR}/时 | {MAX_ORDERS_PER_DAY}/24h")
         print(f"🔄 账号数: {len(self.accounts)} | 切���阈值: ¥{SWITCH_COST_PER_10K}/万")
         print(f"⌨️  按 'q' 键随时退出")
+        print(f"📈 最小成交量: ${self.min_volume_threshold:,.0f} USD | 最大轮次: {self.max_round_retries}")
         print("=" * 70)
 
         # 发送启动通知
@@ -1290,6 +1297,8 @@ class WebSocketScalper:
                 f"🚀 Paradex Scalper 多号版已启动\n"
                 f"👥 账号数: {len(self.accounts)}\n"
                 f"⚠️ 切换阈值: ¥{SWITCH_COST_PER_10K}/万\n"
+                f"📈 最小成交量: ${self.min_volume_threshold:,.0f} USD\n"
+                f"🔄 最大轮次: {self.max_round_retries}\n"
                 f"账号列表:\n{account_list}"
             )
 
@@ -1327,14 +1336,12 @@ class WebSocketScalper:
                 if result == "STOP_REQUESTED":
                     break  # 停止请求，退出
                 elif result == "SWITCH_ACCOUNT":
-                    self.accounts_completed += 1
-                    logger.info(f"📊 已完成账号: {self.accounts_completed}/{len(self.accounts)}")
-
-                    # 检查是否所有账号都已完成
-                    if self.accounts_completed >= len(self.accounts):
-                        logger.info(f"✅ 所有 {len(self.accounts)} 个账号已完成交易")
+                    # 新的切号逻辑已在 switch_account 中处理
+                    # 检查是否达到最大轮次
+                    if self.current_round >= self.max_round_retries:
+                        logger.info(f"✅ 达到最大轮次 {self.max_round_retries}，停止交易")
                         print(f"\n{'='*70}")
-                        print(f"✅ 所有 {len(self.accounts)} 个账号已完成 {MAX_CYCLES} 次循环")
+                        print(f"✅ 已完成 {self.current_round} 轮交易")
                         print(f"{'='*70}\n")
                         break
 
@@ -1518,6 +1525,11 @@ class WebSocketScalper:
                         # 检查是否被收取手续费 - 切换到下一个账号
                         if not is_free:
                             logger.warning("💰 检测到手续费，切换账号...")
+
+                            # 检查是否只剩最后一个号需要刷量
+                            if await self.check_and_handle_last_account():
+                                continue  # 暂停后继续当前账号
+
                             await self.switch_account("检测到手续费")
                             # 检查连续低量切号是否达上限
                             if self.consecutive_low_volume_switches >= self.MAX_CONSECUTIVE_LOW_VOLUME:
@@ -1575,6 +1587,11 @@ class WebSocketScalper:
                                 elif now - self.high_cost_start_time >= self.SWITCH_COST_DELAY_SECONDS:
                                     # 持续超时，切换账号
                                     logger.warning(f"📊 磨损过高持续 {self.SWITCH_COST_DELAY_SECONDS}s: {stats['per_10k']:+.2f}/万，切换账号...")
+
+                                    # 检查是否只剩最后一个号需要刷量
+                                    if await self.check_and_handle_last_account():
+                                        continue  # 暂停后继续当前账号
+
                                     await self.switch_account(f"磨损过高({stats['per_10k']:+.2f}/万)")
                                     # 检查连续低量切号是否达上限
                                     if self.consecutive_low_volume_switches >= self.MAX_CONSECUTIVE_LOW_VOLUME:
@@ -1886,6 +1903,60 @@ class WebSocketScalper:
             logger.error(f"处理回调失败: {e}")
             await self.tg_notifier.answer_callback(query_id, f"错误: {e}")
 
+    async def check_and_handle_last_account(self) -> bool:
+        """检查是否只剩最后一个账号需要刷量，如果是则暂停5分钟后继续
+
+        Returns:
+            bool: True表示已处理(暂停后继续当前账号)，False表示正常切号
+        """
+        # 只有在完成一轮后才检查
+        if not self.round_completed:
+            return False
+
+        # 统计当前有多少账号成交量不足
+        stats = self.pnl_tracker.get_stats()
+        current_idx = self.current_account_index
+
+        # 临时记录当前账号成交量
+        temp_volumes = self.account_volumes.copy()
+        temp_volumes[current_idx] = stats['volume']
+
+        # 检查有多少账号成交量不足
+        low_volume_accounts = []
+        for idx in range(len(self.accounts)):
+            volume = temp_volumes.get(idx, 0)
+            if volume < self.min_volume_threshold:
+                retry_count = self.account_retry_count.get(idx, 0)
+                if retry_count < self.max_round_retries:
+                    low_volume_accounts.append(idx)
+
+        # 如果只剩当前账号成交量不足
+        if len(low_volume_accounts) == 1 and low_volume_accounts[0] == current_idx:
+            logger.warning(f"⚠️ 只剩当前账号 {self.current_account_name} 成交量不足")
+            logger.info(f"💤 暂停5分钟后继续刷量...")
+
+            await self.tg_notifier.send(
+                f"⚠️ *最后一个账号触发切号条件*\n\n"
+                f"账号: `{self.current_account_name}`\n"
+                f"当前成交量: `${stats['volume']:,.0f}` USD\n"
+                f"目标成交量: `${self.min_volume_threshold:,.0f}` USD\n\n"
+                f"💤 暂停 5 分钟后继续刷量..."
+            )
+
+            # 暂停5分钟 (300秒)
+            for remaining in range(300, 0, -1):
+                if not self.running:
+                    break
+                mins, secs = divmod(remaining, 60)
+                self.update_display(f"💤 最后一号暂停中 {mins}:{secs:02d}")
+                await asyncio.sleep(1)
+
+            logger.info("✅ 暂停结束，继续刷量")
+            await self.tg_notifier.send("✅ 暂停结束，继续刷量")
+            return True
+
+        return False
+
     async def switch_account(self, reason: str):
         """切换到下一个账号
 
@@ -1897,6 +1968,10 @@ class WebSocketScalper:
         logger.info(f"📊 账号切换 [{self.current_account_name}] 原因: {reason}")
         logger.info(f"   统计: 循环 {self.cycle_count} | 盈亏: ${stats['pnl']:+.4f} | 磨损: {stats['per_10k']:+.2f}/万")
         logger.info(f"   成交量: ${stats['volume']:,.2f} | 方向: 多{stats['long']} 空{stats['short']}")
+
+        # 记录当前账号的成交量
+        current_idx = self.current_account_index
+        self.account_volumes[current_idx] = stats['volume']
 
         # 判断是否为低交易量切号
         if stats['volume'] < self.LOW_VOLUME_THRESHOLD:
@@ -1956,8 +2031,48 @@ class WebSocketScalper:
 
             print(f"✅ 持仓已清空，继续切换账号")
 
-        # 切换到下一个账号
-        self.current_account_index = (self.current_account_index + 1) % len(self.accounts)
+        # 检查是否所有账号都已切过一轮
+        if len(self.account_volumes) >= len(self.accounts):
+            self.round_completed = True
+            logger.info(f"✅ 完成第 {self.current_round + 1} 轮，所有账号已切换一次")
+
+            # 检查哪些账号成交量不足
+            low_volume_accounts = []
+            for idx, volume in self.account_volumes.items():
+                if volume < self.min_volume_threshold:
+                    retry_count = self.account_retry_count.get(idx, 0)
+                    if retry_count < self.max_round_retries:
+                        low_volume_accounts.append((idx, volume, retry_count))
+
+            if low_volume_accounts:
+                # 按成交量从小到大排序，优先刷成交量最少的
+                low_volume_accounts.sort(key=lambda x: x[1])
+                next_idx, vol, retry = low_volume_accounts[0]
+
+                logger.info(f"🔄 账号 {self.accounts[next_idx]['name']} 成交量不足: ${vol:,.0f} < ${self.min_volume_threshold:,.0f}")
+                logger.info(f"   重试次数: {retry + 1}/{self.max_round_retries}")
+
+                # 切换到成交量不足的账号
+                self.current_account_index = next_idx
+                self.account_retry_count[next_idx] = retry + 1
+
+                # 清空该账号的成交量记录，重新开始
+                self.account_volumes[next_idx] = 0
+            else:
+                # 所有账号都达标，完成一轮
+                self.current_round += 1
+                logger.info(f"🎉 第 {self.current_round} 轮完成！所有账号成交量均达标")
+
+                # 重置轮次数据
+                self.account_volumes.clear()
+                self.account_retry_count.clear()
+                self.round_completed = False
+
+                # 切换到下一个账号
+                self.current_account_index = (self.current_account_index + 1) % len(self.accounts)
+        else:
+            # 还没完成一轮，继续切换到下一个账号
+            self.current_account_index = (self.current_account_index + 1) % len(self.accounts)
 
         # 关闭当前连接
         try:
@@ -1967,7 +2082,7 @@ class WebSocketScalper:
 
         print(f"\n{'='*70}")
         print(f"🔄 切换到账号: [{self.current_account_index + 1}/{len(self.accounts)}] {self.accounts[self.current_account_index]['name']}")
-        print(f"📊 进度: 已完成 {self.accounts_completed}/{len(self.accounts)} 个账号")
+        print(f"📊 进度: 第 {self.current_round + 1} 轮 | 已切换 {len(self.account_volumes)}/{len(self.accounts)} 个账号")
         print(f"{'='*70}\n")
 
     async def reset_for_new_account(self):
@@ -2072,7 +2187,49 @@ async def main():
         print("❌ 没有有效账号! 请在 config.py 中至少配置一个账号的 L2_ADDRESS 和 L2_PRIVATE_KEY。")
         return
 
+    # 输入最小成交量阈值
+    print("\n" + "="*70)
+    print("🔧 参数配置")
+    print("="*70)
+
+    while True:
+        try:
+            min_volume_input = input("请输入最小成交量阈值 (10-500万，单位:万USD): ").strip()
+            min_volume = float(min_volume_input)
+            if 10 <= min_volume <= 500:
+                min_volume_threshold = min_volume * 10000  # 转换为USD
+                break
+            else:
+                print("❌ 输入超出范围，请输入 10-500 之间的数字")
+        except ValueError:
+            print("❌ 输入无效，请输入数字")
+        except KeyboardInterrupt:
+            print("\n⏹️ 已取消")
+            return
+
+    # 输入最大循环次数
+    while True:
+        try:
+            max_cycles_input = input("请输入最大循环次数 (100-10000): ").strip()
+            max_cycles = int(max_cycles_input)
+            if 100 <= max_cycles <= 10000:
+                break
+            else:
+                print("❌ 输入超出范围，请输入 100-10000 之间的整数")
+        except ValueError:
+            print("❌ 输入无效，请输入整数")
+        except KeyboardInterrupt:
+            print("\n⏹️ 已取消")
+            return
+
+    print(f"\n✅ 配置完成:")
+    print(f"   最小成交量: ${min_volume_threshold:,.0f} USD ({min_volume}万)")
+    print(f"   最大循环次数: {max_cycles}")
+    print("="*70 + "\n")
+
     scalper = WebSocketScalper(ACCOUNTS)
+    scalper.min_volume_threshold = min_volume_threshold
+    scalper.max_round_retries = max_cycles
     await scalper.start()
 
 
